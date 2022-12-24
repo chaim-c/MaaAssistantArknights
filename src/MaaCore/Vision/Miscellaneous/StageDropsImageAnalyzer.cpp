@@ -7,6 +7,7 @@
 #include "Config/Miscellaneous/ItemConfig.h"
 #include "Config/Miscellaneous/StageDropsConfig.h"
 #include "Config/TaskData.h"
+#include "Config/TemplResource.h"
 #include "Utils/ImageIo.hpp"
 #include "Utils/Logger.hpp"
 #include "Vision/MatchImageAnalyzer.h"
@@ -192,9 +193,9 @@ bool asst::StageDropsImageAnalyzer::analyze_drops()
 
             std::string item = match_item(item_roi, drop_type, size - i, size);
             bool use_word_model = item == LMD_ID;
-            int quantity = match_quantity(item_roi, use_word_model);
+            int quantity = match_quantity(item_roi, item, use_word_model);
             if (use_word_model && quantity == 0) {
-                quantity = match_quantity(item_roi, false);
+                quantity = match_quantity(item_roi, item, false);
             }
             Log.info("Item id:", item, ", quantity:", quantity);
 #ifdef ASST_DEBUG
@@ -462,109 +463,31 @@ std::string asst::StageDropsImageAnalyzer::match_item(const Rect& roi, StageDrop
     return result;
 }
 
-int asst::StageDropsImageAnalyzer::match_quantity(const Rect& roi, bool use_word_model)
+int asst::StageDropsImageAnalyzer::match_quantity(const Rect& roi, const std::string& item, bool use_word_model)
 {
     auto task_ptr = Task.get<MatchTaskInfo>("StageDrops-Quantity");
+    auto templ = TemplResource::get_instance().get_templ(item);
 
-    Rect quantity_roi = roi.move(task_ptr->roi);
-    cv::Mat quantity_img = m_image(make_rect<cv::Rect>(quantity_roi));
-
-    cv::Mat gray;
-    cv::cvtColor(quantity_img, gray, cv::COLOR_BGR2GRAY);
-    cv::Mat bin;
-    cv::inRange(gray, task_ptr->mask_range.first, task_ptr->mask_range.second, bin);
-
-    // split
-    const int max_spacing = static_cast<int>(task_ptr->templ_threshold);
-    std::vector<cv::Range> contours;
-    int i_right = bin.cols - 1, i_left = 0;
-    bool in = false;
-    int spacing = 0;
-
-    for (int i = bin.cols - 1; i >= 0; --i) {
-        bool has_white = false;
-        for (int j = 0; j < bin.rows; ++j) {
-            if (bin.at<uchar>(j, i)) {
-                has_white = true;
-                break;
-            }
-        }
-        if (in && !has_white) {
-            i_left = i;
-            in = false;
-            spacing = 0;
-            contours.emplace_back(i_left, i_right + 1); // range 是前闭后开的
-        }
-        else if (!in && has_white) {
-            i_right = i;
-            in = true;
-        }
-        else if (!in) {
-            if (++spacing > max_spacing && i_left != 0) {
-                // filter out noise
-                break;
-            }
-        }
-    }
-
-    if (contours.empty()) {
-        return 0;
-    }
-
-    // 前面的 split 算法经过了大量的测试集验证，分割效果一切正常
-    // 后来发现不需要 split 了（为了优化识别速度），但是这个算法不太敢动，怕出问题
-    // 所以这里保留前面的 split 算法，直接取两侧端点。（反正前面跑几个循环也费不了多长时间）
-    int far_left = contours.back().start;
-    int far_right = contours.front().end;
-
-    OcrWithPreprocessImageAnalyzer analyzer(m_image);
-    analyzer.set_task_info("NumberOcrReplace");
-    analyzer.set_roi(Rect(quantity_roi.x + far_left, quantity_roi.y, far_right - far_left, quantity_roi.height));
-    analyzer.set_expansion(1);
-    analyzer.set_threshold(task_ptr->mask_range.first, task_ptr->mask_range.second);
-    analyzer.set_use_char_model(!use_word_model);
-
+    MatchImageAnalyzer analyzer(m_image);
+    analyzer.set_templ(templ);
+    analyzer.set_mask_range(1, 255);
+    analyzer.set_mask_with_close(true);
+    analyzer.set_roi(roi);
     if (!analyzer.analyze()) {
         return 0;
     }
+    Rect new_roi = analyzer.get_result().rect;
+    cv::Mat item_img = m_image(make_rect<cv::Rect>(new_roi));
+    cv::Mat quantity_img = item_img - templ;
+    // 灰度
+    cv::Mat gray;
+    cv::cvtColor(quantity_img, gray, cv::COLOR_BGR2GRAY);
+    cv::Mat bin;
+    cv::threshold(gray, bin, 100, 255, cv::THRESH_BINARY);
 
-    const auto& result = analyzer.get_result().front();
+    cv::Mat bin_roi = bin(cv::Rect(0, 76, bin.cols, 22));
 
-#ifdef ASST_DEBUG
-    cv::rectangle(m_image_draw, make_rect<cv::Rect>(result.rect), cv::Scalar(0, 0, 255));
-    if (use_word_model) {
-        cv::putText(m_image_draw, result.text, cv::Point(result.rect.x, result.rect.y - 20), cv::FONT_HERSHEY_SIMPLEX,
-                    0.5, cv::Scalar(0, 0, 255), 2);
-    }
-    else {
-        cv::putText(m_image_draw, result.text, cv::Point(result.rect.x, result.rect.y - 5), cv::FONT_HERSHEY_SIMPLEX,
-                    0.5, cv::Scalar(0, 255, 0), 2);
-    }
-#endif
+    std::ignore = use_word_model;
 
-    std::string digit_str = result.text;
-    int multiple = 1;
-    if (size_t w_pos = digit_str.find("万"); w_pos != std::string::npos) {
-        multiple = 10000;
-        digit_str.erase(w_pos, digit_str.size());
-    }
-    else if (size_t k_pos = digit_str.find("k"); k_pos != std::string::npos) {
-        multiple = 1000;
-        digit_str.erase(k_pos, digit_str.size());
-    }
-
-    constexpr char Dot = '.';
-    if (digit_str.empty() ||
-        !ranges::all_of(digit_str, [](const char& c) -> bool { return std::isdigit(c) || c == Dot; })) {
-        return 0;
-    }
-    if (auto dot_pos = digit_str.find(Dot); dot_pos != std::string::npos) {
-        if (dot_pos == 0 || dot_pos == digit_str.size() - 1 || digit_str.find(Dot, dot_pos + 1) != std::string::npos) {
-            return 0;
-        }
-    }
-
-    int quantity = static_cast<int>(std::stod(digit_str) * multiple);
-    Log.info("Quantity:", quantity);
-    return quantity;
+    return 0;
 }
